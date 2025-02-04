@@ -7,7 +7,7 @@ class Recurso:
         self.nome = nome
         self.id = identificador
         self.quantidade = quantidade
-        self.disponivel = quantidade  # Instâncias disponíveis
+        self.disponivel = quantidade
         self.lock = threading.Lock()
 
 class SistemaOperacional(threading.Thread):
@@ -25,7 +25,6 @@ class SistemaOperacional(threading.Thread):
             self.detectar_deadlock()
 
     def detectar_deadlock(self):
-        # Considera deadlock quando algum processo está bloqueado aguardando recurso
         bloqueados = [p for p in self.processos if p.status == "Bloqueado"]
         mensagem = "\nVerificando por deadlocks...\n"
         if bloqueados:
@@ -59,11 +58,14 @@ class Processo(threading.Thread):
             time.sleep(self.intervalo_solicitacao)
             recurso = random.choice(self.recursos)
             adquirido = False
-            # Tenta adquirir o recurso de forma atômica
-            with recurso.lock:
+
+            recurso.lock.acquire()
+            try:
                 if recurso.disponivel > 0:
                     recurso.disponivel -= 1
                     adquirido = True
+            finally:
+                recurso.lock.release()
 
             if adquirido:
                 self.recurso_atual = recurso
@@ -71,8 +73,13 @@ class Processo(threading.Thread):
                 self.status = "Rodando"
                 self.atualizar_log(f"Processo {self.id} alocou {recurso.nome}.")
                 time.sleep(self.tempo_utilizacao)
-                with recurso.lock:
+                
+                recurso.lock.acquire()
+                try:
                     recurso.disponivel += 1
+                finally:
+                    recurso.lock.release()
+
                 self.atualizar_log(f"Processo {self.id} liberou {recurso.nome}.")
                 self.recurso_atual = None
                 self.status = "Bloqueado"
