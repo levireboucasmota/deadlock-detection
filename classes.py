@@ -3,7 +3,7 @@ import time
 import random
 
 class Recurso:
-    def __init__(self, nome, identificador, quantidade):
+    def __init__(self, nome, identificador, quantidade, atualizar_log):
         self.nome = nome
         self.identificador = identificador
         self.quantidade_total = quantidade
@@ -11,13 +11,14 @@ class Recurso:
         self.alocados = {}  # Dicionário para rastrear quais processos possuem este recurso
         self.lock = threading.Lock()  # Lock para sincronização
         self.condition = threading.Condition(self.lock)  # Condição para notificar processos bloqueados
+        self.atualizar_log = atualizar_log  # Referência ao método de log
 
     def solicitar(self, processo_id):
         with self.lock:
             while self.quantidade_disponivel == 0:
-                print(f"[Processo {processo_id}] Aguardando recurso {self.nome}...")
+                self.atualizar_log(f"[Processo {processo_id}] Aguardando recurso {self.nome}...")
                 self.condition.wait()  # Aguarda até que o recurso seja liberado
-            print(f"[Processo {processo_id}] Solicitando recurso {self.nome}")
+            self.atualizar_log(f"[Processo {processo_id}] Solicitando recurso {self.nome}")
             self.quantidade_disponivel -= 1
             self.alocados[processo_id] = self.alocados.get(processo_id, 0) + 1
 
@@ -28,12 +29,11 @@ class Recurso:
                 if self.alocados[processo_id] == 0:
                     del self.alocados[processo_id]
                 self.quantidade_disponivel += 1
-                print(f"[Processo {processo_id}] Liberando recurso {self.nome}")
+                self.atualizar_log(f"[Processo {processo_id}] Liberando recurso {self.nome}")
                 self.condition.notify_all()  # Notifica processos bloqueados
 
-
 class Processo(threading.Thread):
-    def __init__(self, id, delta_ts, delta_tu, recursos):
+    def __init__(self, id, delta_ts, delta_tu, recursos, atualizar_log):
         super().__init__()
         self.id = id
         self.delta_ts = delta_ts  # Intervalo de tempo para solicitar recursos
@@ -42,11 +42,13 @@ class Processo(threading.Thread):
         self.status = "rodando"  # Status pode ser "rodando" ou "bloqueado"
         self.recursos_alocados = []  # Recursos atualmente alocados ao processo
         self.lock = threading.Lock()
+        self.running = True
+        self.atualizar_log = atualizar_log  # Referência ao método de log
 
     def run(self):
-        while True:
+        while self.running:
             time.sleep(self.delta_ts)
-            if self.status == "finalizado":
+            if not self.running:
                 break
 
             # Libera recursos que já foram utilizados pelo tempo necessário
@@ -55,43 +57,34 @@ class Processo(threading.Thread):
                     if time.time() - tempo_alocacao >= self.delta_tu:
                         recurso.liberar(self.id)
                         self.recursos_alocados.remove((recurso, tempo_alocacao))
-                        print(f"[Processo {self.id}] Liberou recurso {recurso.nome}")
+                        self.atualizar_log(f"[Processo {self.id}] Liberou recurso {recurso.nome}")
 
             # Solicita um novo recurso aleatório
             try:
                 recurso = random.choice(self.recursos)
                 recurso.solicitar(self.id)
                 self.recursos_alocados.append((recurso, time.time()))  # Armazena o recurso e o tempo de alocação
-                print(f"[Processo {self.id}] Solicitou recurso {recurso.nome}")
+                self.atualizar_log(f"[Processo {self.id}] Solicitou recurso {recurso.nome}")
             except Exception as e:
-                print(f"[Processo {self.id}] Erro ao manipular recurso: {e}")
+                self.atualizar_log(f"[Processo {self.id}] Erro ao manipular recurso: {e}")
 
     def finalizar(self):
         with self.lock:
-            self.status = "finalizado"
-
+            self.running = False
 
 class SistemaOperacional(threading.Thread):
-    def __init__(self, recursos, intervalo_verificacao):
+    def __init__(self, recursos, intervalo_verificacao, atualizar_log):
         super().__init__()
         self.recursos = recursos
         self.intervalo_verificacao = intervalo_verificacao
         self.processos = []
         self.lock = threading.Lock()
+        self.running = True
+        self.atualizar_log = atualizar_log  # Referência ao método de log
 
     def adicionar_processo(self, processo):
         with self.lock:
             self.processos.append(processo)
-
-    def remover_processo(self, id):
-        with self.lock:
-            for processo in self.processos:
-                if processo.id == id:
-                    processo.finalizar()
-                    print(f"[SO] Processo {id} eliminado")
-                    self.processos.remove(processo)
-                    return
-            print(f"[SO] Processo {id} não encontrado")
 
     def verificar_deadlock(self):
         with self.lock:
@@ -101,7 +94,6 @@ class SistemaOperacional(threading.Thread):
                 allocation_matrix[processo.id] = {
                     r.identificador: r.alocados.get(processo.id, 0) for r in self.recursos
                 }
-
             # Construir matriz de requisição (Request Matrix)
             request_matrix = {}
             for processo in self.processos:
@@ -109,71 +101,37 @@ class SistemaOperacional(threading.Thread):
                     r.identificador: 1 if processo.status == "bloqueado" and r.quantidade_disponivel == 0 else 0
                     for r in self.recursos
                 }
-
             # Vetor de recursos disponíveis (Available Vector)
             available_vector = {r.identificador: r.quantidade_disponivel for r in self.recursos}
-
             # Detectar deadlock usando o algoritmo de detecção de ciclos
-            processos_finalizados = set()
+            work = available_vector.copy()
+            finish = {p.id: False for p in self.processos}
+            safe_sequence = []
             while True:
-                processo_encontrado = False
+                found = False
                 for processo in self.processos:
-                    if processo.id in processos_finalizados:
-                        continue
-
-                    # Verificar se o processo pode ser concluído
-                    pode_concluir = True
-                    for recurso in self.recursos:
-                        if request_matrix[processo.id][recurso.identificador] > available_vector[recurso.identificador]:
-                            pode_concluir = False
+                    if not finish[processo.id]:
+                        if all(allocation_matrix[processo.id][r.identificador] + work[r.identificador] >= request_matrix[processo.id][r.identificador] for r in self.recursos):
+                            for r in self.recursos:
+                                work[r.identificador] += allocation_matrix[processo.id][r.identificador]
+                            finish[processo.id] = True
+                            safe_sequence.append(processo.id)
+                            found = True
                             break
-
-                    if pode_concluir:
-                        # Liberar recursos do processo
-                        for recurso in self.recursos:
-                            available_vector[recurso.identificador] += allocation_matrix[processo.id][recurso.identificador]
-                        processos_finalizados.add(processo.id)
-                        processo_encontrado = True
-
-                if not processo_encontrado:
+                if not found:
                     break
-
             # Se houver processos que não foram finalizados, há deadlock
-            processos_bloqueados = [p.id for p in self.processos if p.id not in processos_finalizados]
+            processos_bloqueados = [p.id for p in self.processos if not finish[p.id]]
             if processos_bloqueados:
-                print(f"[SO] Deadlock detectado envolvendo os processos: {processos_bloqueados}")
+                self.atualizar_log(f"[SO] Deadlock detectado envolvendo os processos: {processos_bloqueados}")
             else:
-                print("[SO] Nenhum deadlock detectado.")
+                self.atualizar_log("[SO] Nenhum deadlock detectado.")
 
     def run(self):
-        while True:
+        while self.running:
             time.sleep(self.intervalo_verificacao)
-            print("[SO] Verificando deadlocks...")
+            self.atualizar_log("[SO] Verificando deadlocks...")
             self.verificar_deadlock()
 
-
-# Configuração inicial
-recursos = [
-    Recurso(nome="Impressora", identificador=1, quantidade=1),
-    Recurso(nome="Scanner", identificador=2, quantidade=1),
-]
-
-so = SistemaOperacional(recursos=recursos, intervalo_verificacao=7)
-so.start()
-
-# Criação de processos
-processos = []
-for i in range(1, 3):  # Exemplo com 4 processos
-    processo = Processo(id=i, delta_ts=5, delta_tu=10, recursos=recursos)
-    so.adicionar_processo(processo)
-    processos.append(processo)
-    processo.start()
-
-# Simulação contínua
-try:
-    while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    print("Encerrando simulação...")
-    for processo in processos:
-        processo.finalizar()
+    def parar(self):
+        self.running = False
